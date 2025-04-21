@@ -22,3 +22,15 @@ impl From<serde_json::error::Error> for SurrealSocketError {
         SurrealSocketError::new(&format!("serde_json error: {:?}", e))
     }
 }
+
+impl From<String> for SurrealSocketError {
+    fn from(e: String) -> Self {
+        SurrealSocketError::new(&format!("SurrealDB error: {}", e))
+    }
+}
+
+impl From<&str> for SurrealSocketError {
+    fn from(e: &str) -> Self {
+        SurrealSocketError::new(&format!("SurrealDB error: {}", e))
+    }
+}

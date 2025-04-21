@@ -14,10 +14,10 @@ use surrealdb::sql::Thing;
 use surrealdb::sql::{Id, Uuid};
 use surrealdb::Surreal;
 
+const CREATED_AT_FIELD: &str = "z_created_at";
+const UPDATED_AT_FIELD: &str = "z_updated_at";
+
 /// Methods associated with SurrealDB tables
-///
-/// This trait should be implemented for concrete types.
-/// For generic types, use the `GenericResource` struct instead.
 #[async_trait]
 pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
     /// Get the associated table name
@@ -36,12 +36,30 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         false
     }
 
-    /// This method is called immediately before a record is deleted by `db_delete()`.
-    ///
-    /// Override this method to perform checks or cleanup tasks before the object's deletion.
-    ///
     /// If the method returns an `Error`, the deletion will be aborted and `db_delete()` will return the error.
-    async fn delete_hook(&self) -> Result<(), SurrealSocketError> {
+    async fn pre_delete_hook(&self) -> Result<(), SurrealSocketError> {
+        Ok(())
+    }
+
+    async fn post_delete_hook(&self) -> Result<(), SurrealSocketError> {
+        Ok(())
+    }
+
+    /// If the method returns an `Error`, the update will be aborted and `db_update()`/`db_create()` will return the error.
+    async fn pre_update_hook(&self) -> Result<(), SurrealSocketError> {
+        Ok(())
+    }
+
+    async fn post_update_hook(&self) -> Result<(), SurrealSocketError> {
+        Ok(())
+    }
+
+    /// If the method returns an `Error`, the creation will be aborted and `db_create()` will return the error.
+    async fn pre_create_hook(&self) -> Result<(), SurrealSocketError> {
+        Ok(())
+    }
+
+    async fn post_create_hook(&self) -> Result<(), SurrealSocketError> {
         Ok(())
     }
 
@@ -111,13 +129,37 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
 
     /// Add a new record to the database and return it.
     async fn db_create(&self, client: &Surreal<Client>) -> Result<Self, SurrealSocketError> {
+        self.pre_create_hook().await?;
+        self.pre_update_hook().await?;
         let serde_value = serde_json::to_value(self)?;
+
+        let mut serde_value = match serde_value.as_object() {
+            Some(obj) => obj.clone(),
+            None => {
+                return Err(SurrealSocketError::new(
+                    "Failed to convert the object to a Map",
+                ))
+            }
+        };
+
+        serde_value.insert(
+            CREATED_AT_FIELD.to_owned(),
+            serde_json::to_value(Utc::now())?,
+        );
+        serde_value.insert(
+            UPDATED_AT_FIELD.to_owned(),
+            serde_json::to_value(Utc::now())?,
+        );
+
         let id = self.uuid().uuid_string();
 
         let opt: Option<Self> = client
             .create((Self::table(), id.to_owned()))
             .content(serde_value)
             .await?;
+
+        self.post_create_hook().await?;
+        self.post_update_hook().await?;
 
         match opt {
             Some(e) => Ok(e),
@@ -127,7 +169,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
 
     /// Delete a record from the database.
     async fn db_delete(&self, client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
-        self.delete_hook().await?;
+        self.pre_delete_hook().await?;
 
         if Self::use_trash() {
             let created: Option<Self> = client
@@ -148,6 +190,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
 
         let thing = self.thing();
         let _: Option<Self> = client.delete((thing.tb, self.uuid().uuid_string())).await?;
+        self.post_delete_hook().await?;
         Ok(())
     }
 
@@ -167,13 +210,20 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
     /// Update several fields of a record in the database at once.
     ///
     /// The first value of the tuple is the field name, and the second is the value to set.
+    ///
+    /// Use serde_json::json!() for the values if they are different types.
     async fn db_update_fields<T: Serialize + Sync + Send + Clone>(
         &self,
         client: &Surreal<Client>,
         updates: Vec<(&str, T)>,
     ) -> Result<(), SurrealSocketError> {
+        self.pre_update_hook().await?;
         let mut merge_data = HashMap::<String, serde_json::Value>::new();
-        merge_data.insert("updated_at".to_owned(), serde_json::to_value(Utc::now())?);
+
+        merge_data.insert(
+            UPDATED_AT_FIELD.to_owned(),
+            serde_json::to_value(Utc::now())?,
+        );
 
         for update in updates {
             merge_data.insert(update.0.to_owned(), serde_json::to_value(update.1.clone())?);
@@ -184,17 +234,39 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
             .merge(merge_data)
             .await?;
 
+        self.post_delete_hook().await?;
+        Ok(())
+    }
+
+    async fn db_overwrite(&self, client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
+        self.pre_update_hook().await?;
+        let serde_value = serde_json::to_value(self)?;
+        let id = self.uuid().uuid_string();
+
+        let mut serde_value = match serde_value.as_object() {
+            Some(obj) => obj.clone(),
+            None => return Err(SurrealSocketError::new("Failed to convert object to Map")),
+        };
+
+        serde_value.insert(
+            UPDATED_AT_FIELD.to_owned(),
+            serde_json::to_value(Utc::now())?,
+        );
+
+        let _: Option<Self> = client
+            .update((Self::table(), id))
+            .content(serde_value)
+            .await?;
+
+        self.post_update_hook().await?;
         Ok(())
     }
 
     async fn db_all(client: &Surreal<Client>) -> Result<Vec<Self>, SurrealSocketError> {
-        let table = Self::table();
-        client.set("table", table).await?;
+        client.set("table", Self::table()).await?;
         let mut response = client.query("SELECT * FROM type::table($table)").await?;
-        let result: surrealdb::Value = response.take(0)?;
-        let serde_value = result.into_inner().into_json();
-        let value: Vec<Self> = serde_json::from_value(serde_value).unwrap();
-        Ok(value)
+        let result: Vec<Self> = response.take(0)?;
+        Ok(result)
     }
 
     /// For each record in the table, add any missing properties with default values to the record in the database.
@@ -262,7 +334,7 @@ where
         self.0.to_owned()
     }
 
-    /// Get the UUID as a string.
+    /// Get the UUID as a string. (Format: 87e4f33a-e9e1-411c-8f74-9f6f1098096e)
     pub fn uuid_string(&self) -> String {
         match &self.0.id {
             Id::Uuid(uuid) => uuid.0.to_string(),
@@ -301,6 +373,12 @@ where
     {
         let obj: Option<T> = T::db_by_id(client, &self.uuid_string()).await?;
         Ok(obj)
+    }
+}
+
+impl<T: DBRecord> Display for SsUuid<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.0.tb, self.uuid_string())
     }
 }
 
