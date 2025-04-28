@@ -1,9 +1,11 @@
 use crate::error::SurrealSocketError;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use futures::future::BoxFuture;
 use serde::{de::DeserializeOwned, Serialize};
 use serde::{Deserialize, Deserializer, Serializer};
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::{
     any::Any,
     collections::HashMap,
@@ -17,23 +19,47 @@ use surrealdb::Surreal;
 const CREATED_AT_FIELD: &str = "z_created_at";
 const UPDATED_AT_FIELD: &str = "z_updated_at";
 
+#[derive(Serialize)]
+pub struct SsTable(String);
+
+impl Display for SsTable {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl SsTable {
+    pub fn new(table: &str) -> Self {
+        SsTable(table.to_owned())
+    }
+}
+
 /// Methods associated with SurrealDB tables
 #[async_trait]
 pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
-    /// Get the associated table name
-    fn table() -> &'static str;
+    /// The associated table name
+    const TABLE_NAME: &'static str;
 
     /// Get the UUID associated with the record
     fn uuid(&self) -> SsUuid<Self>;
 
-    /// Get the Thing (`surrealdb::sql::thing::Thing`) associated with the record
-    fn thing(&self) -> Thing {
-        self.uuid().thing()
-    }
-
     /// Whether records should be moved to a table named `z_trashed_{table}` on `db_delete()`
     fn use_trash() -> bool {
         false
+    }
+
+    /// Defines records in other tables that should be cascade-deleted when this record is deleted.
+    ///
+    /// This is used to clean up related records that reference this record by a foreign key field.
+    ///
+    /// ### Example
+    /// ```rust
+    /// fn cascade_delete() -> Vec<CascadeDelete> {
+    /// 	vec![cascade!(OtherModel, "name_of_field_that_references_this_model_by_ssuuid")]
+    /// }
+    /// ```
+    fn cascade_delete() -> Vec<CascadeDelete> {
+        vec![]
     }
 
     /// If the method returns an `Error`, the deletion will be aborted and `db_delete()` will return the error.
@@ -63,6 +89,15 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         Ok(())
     }
 
+    fn table() -> SsTable {
+        SsTable::new(Self::TABLE_NAME)
+    }
+
+    /// Get the Thing (`surrealdb::sql::thing::Thing`) associated with the record
+    fn thing(&self) -> Thing {
+        self.uuid().thing()
+    }
+
     /// Get an object from SurrealDB by its ID, or `None` if not found.
     ///
     /// Returns an `Error` if SurrealDB unexpectedly fails.
@@ -70,7 +105,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         client: &Surreal<Client>,
         id: &str,
     ) -> Result<Option<Self>, SurrealSocketError> {
-        let thing = Thing::from((Self::table().to_owned(), id.to_owned()));
+        let thing = Thing::from((Self::table().to_string(), id.to_owned()));
         let uuid: SsUuid<Self> = SsUuid::from(thing);
         let item: Option<Self> = Self::db_search_one(client, "uuid", uuid).await?;
         Ok(item.into_iter().next())
@@ -154,7 +189,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         let id = self.uuid().uuid_string();
 
         let opt: Option<Self> = client
-            .create((Self::table(), id.to_owned()))
+            .create((Self::table().to_string(), id.to_owned()))
             .content(serde_value)
             .await?;
 
@@ -170,6 +205,10 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
     /// Delete a record from the database.
     async fn db_delete(&self, client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
         self.pre_delete_hook().await?;
+
+        for ref_ in Self::cascade_delete() {
+            (ref_.func)(Arc::new(client.clone()), self.uuid().to_string()).await?;
+        }
 
         if Self::use_trash() {
             let created: Option<Self> = client
@@ -230,7 +269,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         }
 
         let _: Option<Self> = client
-            .update((Self::table(), self.uuid().uuid_string()))
+            .update((Self::table().to_string(), self.uuid().uuid_string()))
             .merge(merge_data)
             .await?;
 
@@ -254,7 +293,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         );
 
         let _: Option<Self> = client
-            .update((Self::table(), id))
+            .update((Self::table().to_string(), id))
             .content(serde_value)
             .await?;
 
@@ -279,7 +318,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
 
         for item in result {
             let _: Option<Self> = client
-                .update((table, item.uuid().uuid_string()))
+                .update((table.to_string(), item.uuid().uuid_string()))
                 .content(item)
                 .await?;
         }
@@ -288,9 +327,13 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
     }
 
     async fn db_delete_table(client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
-        let table = Self::table();
-        client.set("table", table).await?;
-        client.query(format!("REMOVE TABLE {}", table)).await?;
+        let table_string = Self::table().to_string();
+        client.set("table", table_string.to_owned()).await?;
+
+        client
+            .query(format!("REMOVE TABLE {}", table_string))
+            .await?;
+
         Ok(())
     }
 }
@@ -345,7 +388,7 @@ where
 
     /// Create a new UUID with a random ID for the given table.
     pub fn new() -> Self {
-        Thing::from((T::table().to_owned(), Id::from(Uuid::new_v4()))).into()
+        Thing::from((T::table().to_string(), Id::from(Uuid::new_v4()))).into()
     }
 
     /// Get the object associated with the UUID.
@@ -486,4 +529,41 @@ pub trait Expirable: DBRecord {
         let start_time = self.start_timestamp()?;
         Ok(now - start_time > Self::expiry_seconds() as i64)
     }
+}
+
+pub fn cascade_by<T: DBRecord + 'static>(field: &'static str) -> CascadeFn {
+    Arc::new(move |client: Arc<Surreal<Client>>, uuid: String| {
+        Box::pin(async move {
+            let records = T::db_search(&client, field, uuid.clone()).await?;
+
+            for rec in records {
+                rec.db_delete(&client).await?;
+            }
+
+            Ok(())
+        })
+    })
+}
+
+pub struct CascadeDelete {
+    /// The name of the field in the referencing table that references this record
+    pub field: &'static str,
+    /// The function that performs the deletion (`cascade_by()`)
+    pub func: CascadeFn,
+}
+
+pub type CascadeFn = Arc<
+    dyn Fn(Arc<Surreal<Client>>, String) -> BoxFuture<'static, Result<(), SurrealSocketError>>
+        + Send
+        + Sync,
+>;
+
+#[macro_export]
+macro_rules! cascade {
+    ($type:ty, $field:literal) => {
+        $crate::dbrecord::CascadeDelete {
+            field: $field,
+            func: $crate::dbrecord::cascade_by::<$type>($field),
+        }
+    };
 }
