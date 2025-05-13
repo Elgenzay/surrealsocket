@@ -211,6 +211,22 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         }
 
         if Self::use_trash() {
+            let serde_value = serde_json::to_value(self)?;
+
+            let mut serde_value = match serde_value.as_object() {
+                Some(obj) => obj.clone(),
+                None => {
+                    return Err(SurrealSocketError::new(
+                        "Failed to convert the object to a Map",
+                    ))
+                }
+            };
+
+            serde_value.insert(
+                UPDATED_AT_FIELD.to_owned(),
+                serde_json::to_value(Utc::now())?,
+            );
+
             let created: Option<Self> = client
                 .create((
                     format!("z_trashed_{}", Self::table()),
