@@ -5,6 +5,7 @@ use futures::future::BoxFuture;
 use serde::{de::DeserializeOwned, Serialize};
 use serde::{Deserialize, Deserializer, Serializer};
 use std::marker::PhantomData;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{
     any::Any,
@@ -67,6 +68,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         Ok(())
     }
 
+    /// If the method returns an `Error`, the `db_delete()` will return the error (but the deletion will still occur).
     async fn post_delete_hook(&self) -> Result<(), SurrealSocketError> {
         Ok(())
     }
@@ -76,6 +78,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         Ok(())
     }
 
+    /// If the method returns an `Error`, the `db_update()`/`db_create()` will return the error (but the update will still occur).
     async fn post_update_hook(&self) -> Result<(), SurrealSocketError> {
         Ok(())
     }
@@ -85,6 +88,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         Ok(())
     }
 
+    /// If the method returns an `Error`, the `db_create()` will return the error (but the creation will still occur).
     async fn post_create_hook(&self) -> Result<(), SurrealSocketError> {
         Ok(())
     }
@@ -384,16 +388,27 @@ impl<T: DBRecord> From<Thing> for SsUuid<T> {
     }
 }
 
+impl<T: DBRecord> FromStr for SsUuid<T> {
+    type Err = SurrealSocketError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::from_str(s)
+            .map_err(|_| SurrealSocketError::new(&format!("Invalid UUID string: {}", s)))?;
+
+        Ok(Thing::from((T::table().to_string(), Id::from(uuid))).into())
+    }
+}
+
 impl<T> SsUuid<T>
 where
     T: DBRecord,
 {
-    /// Get the Thing (`surrealdb::sql::thing::Thing`) from the UUID.
+    /// Get the Thing (`surrealdb::sql::thing::Thing`) from the SsUuid.
     pub fn thing(&self) -> Thing {
         self.0.to_owned()
     }
 
-    /// Get the UUID as a string. (Format: 87e4f33a-e9e1-411c-8f74-9f6f1098096e)
+    /// Get the SsUuid as a string. (Format: 87e4f33a-e9e1-411c-8f74-9f6f1098096e)
     pub fn uuid_string(&self) -> String {
         match &self.0.id {
             Id::Uuid(uuid) => uuid.0.to_string(),
@@ -402,12 +417,12 @@ where
         }
     }
 
-    /// Create a new UUID with a random ID for the given table.
+    /// Create a new SsUuid with a random ID for the given table.
     pub fn new() -> Self {
         Thing::from((T::table().to_string(), Id::from(Uuid::new_v4()))).into()
     }
 
-    /// Get the object associated with the UUID.
+    /// Get the object associated with the SsUuid.
     ///
     /// Returns an `Error` if SurrealDB unexpectedly fails.
     ///
@@ -422,7 +437,7 @@ where
         Ok(obj)
     }
 
-    /// Get the object associated with the UUID, or `None` if not found.
+    /// Get the object associated with the SsUuid, or `None` if not found.
     pub async fn object_opt(
         &self,
         client: &Surreal<Client>,
