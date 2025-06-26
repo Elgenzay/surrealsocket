@@ -1,6 +1,6 @@
 use crate::error::SurrealSocketError;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use futures::future::BoxFuture;
 use serde::{de::DeserializeOwned, Serialize};
 use serde::{Deserialize, Deserializer, Serializer};
@@ -510,55 +510,61 @@ impl<T: DBRecord> PartialEq for SsUuid<T> {
 
 #[async_trait]
 pub trait Expirable: DBRecord {
+    // As either DateTime or NaiveDate
     fn start_time_field() -> &'static str;
 
     fn expiry_seconds() -> u64;
 
-    fn start_timestamp(&self) -> Result<i64, SurrealSocketError> {
+    fn start_datetime(&self) -> Result<DateTime<Utc>, SurrealSocketError> {
         let value = serde_json::to_value(self)?;
         let start_time_str = value
             .get(Self::start_time_field())
-            .ok_or(SurrealSocketError::new(
-                "start_time_field() does not match a property in an Expirable",
-            ))?
+            .ok_or_else(|| SurrealSocketError::new("Missing start_time_field in record"))?
             .as_str()
-            .ok_or(SurrealSocketError::new(
-                "start_time_field() does not match a string in an Expirable",
-            ))?;
+            .ok_or_else(|| SurrealSocketError::new("start_time_field must be a string"))?;
 
-        let start_time = DateTime::parse_from_rfc3339(start_time_str).map_err(|e| {
-            SurrealSocketError::new(&format!(
-                "Error parsing start_time_field() as RFC3339: {}",
-                e
-            ))
-        })?;
+        // RFC3339 / DateTime
+        if let Ok(dt) = DateTime::parse_from_rfc3339(start_time_str) {
+            return Ok(dt.with_timezone(&Utc));
+        }
 
-        Ok(start_time.timestamp())
+        // NaiveDate
+        if let Ok(d) = NaiveDate::parse_from_str(start_time_str, "%Y-%m-%d") {
+            return Ok(DateTime::from_naive_utc_and_offset(
+                d.and_hms_opt(0, 0, 0).unwrap(),
+                Utc,
+            ));
+        }
+
+        Err(SurrealSocketError::new("Invalid date format"))
+    }
+
+    fn start_timestamp(&self) -> Result<i64, SurrealSocketError> {
+        Ok(self.start_datetime()?.timestamp())
+    }
+
+    fn is_expired(&self) -> Result<bool, SurrealSocketError> {
+        let now = Utc::now().timestamp();
+        Ok(now - self.start_timestamp()? > Self::expiry_seconds() as i64)
     }
 
     async fn clear_expired(client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
         let earliest_valid_time = Utc::now()
             .checked_sub_signed(Duration::seconds(Self::expiry_seconds() as i64))
-            .ok_or(SurrealSocketError::new(
-                "Out of bounds datetime in clear_expired()",
-            ))?;
+            .ok_or_else(|| SurrealSocketError::new("Datetime underflow"))?;
+
+        let query = format!("time::unix(type::datetime({}))", Self::start_time_field());
 
         Self::db_query(
             client,
             SQLCommand::Delete,
-            format!("time::unix(type::datetime({}))", Self::start_time_field()),
+            query,
             '<',
             earliest_valid_time.timestamp(),
         )
         .await?;
 
         Ok(())
-    }
-
-    fn is_expired(&self) -> Result<bool, SurrealSocketError> {
-        let now = Utc::now().timestamp();
-        let start_time = self.start_timestamp()?;
-        Ok(now - start_time > Self::expiry_seconds() as i64)
     }
 }
 
