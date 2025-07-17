@@ -141,8 +141,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         // Update when this issue is resolved:
         // https://github.com/surrealdb/surrealdb/issues/1693
         let query = format!(
-            "{} FROM type::table($table) WHERE {} {} $value",
-            sql_command, field, operand
+            "{sql_command} FROM type::table($table) WHERE {field} {operand} $value"
         );
 
         let mut response = client.query(query).await?;
@@ -351,7 +350,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         client.set("table", table_string.to_owned()).await?;
 
         client
-            .query(format!("REMOVE TABLE {}", table_string))
+            .query(format!("REMOVE TABLE {table_string}"))
             .await?;
 
         Ok(())
@@ -393,7 +392,7 @@ impl<T: DBRecord> FromStr for SsUuid<T> {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let uuid = Uuid::from_str(s)
-            .map_err(|_| SurrealSocketError::new(&format!("Invalid UUID string: {}", s)))?;
+            .map_err(|_| SurrealSocketError::new(&format!("Invalid UUID string: {s}")))?;
 
         Ok(Thing::from((T::table().to_string(), Id::from(uuid))).into())
     }
