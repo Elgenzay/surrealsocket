@@ -19,19 +19,20 @@ use surrealdb::Surreal;
 
 const CREATED_AT_FIELD: &str = "z_created_at";
 const UPDATED_AT_FIELD: &str = "z_updated_at";
+const DELETED_AT_FIELD: &str = "z_deleted_at";
 
 #[derive(Serialize)]
-pub struct SsTable(String);
+pub struct SsTable(&'static str);
+
+impl SsTable {
+    pub fn new(table: &'static str) -> Self {
+        SsTable(table)
+    }
+}
 
 impl Display for SsTable {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
-    }
-}
-
-impl SsTable {
-    pub fn new(table: &str) -> Self {
-        SsTable(table.to_owned())
     }
 }
 
@@ -40,6 +41,9 @@ impl SsTable {
 pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
     /// The associated table name
     const TABLE_NAME: &'static str;
+
+    /// The name of the field that contains the UUID, used by `db_get_by_id()`
+    const UUID_FIELD: &'static str = "uuid";
 
     /// Get the UUID associated with the record
     fn uuid(&self) -> SsUuid<Self>;
@@ -99,20 +103,20 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
 
     /// Get the Thing (`surrealdb::sql::thing::Thing`) associated with the record
     fn thing(&self) -> Thing {
-        self.uuid().thing()
+        self.uuid().as_thing().to_owned()
     }
 
     /// Get an object from SurrealDB by its ID, or `None` if not found.
     ///
     /// Returns an `Error` if SurrealDB unexpectedly fails.
-    async fn db_by_id(
+    async fn db_get_by_id(
         client: &Surreal<Client>,
         id: &str,
     ) -> Result<Option<Self>, SurrealSocketError> {
         let thing = Thing::from((Self::table().to_string(), id.to_owned()));
         let uuid: SsUuid<Self> = SsUuid::from(thing);
-        let item: Option<Self> = Self::db_search_one(client, "uuid", uuid).await?;
-        Ok(item.into_iter().next())
+        let item: Option<Self> = Self::db_search_one(client, Self::UUID_FIELD, uuid).await?;
+        Ok(item)
     }
 
     /// Get a `Vec` of objects in the database where `field` matches `value`.
@@ -140,9 +144,8 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
 
         // Update when this issue is resolved:
         // https://github.com/surrealdb/surrealdb/issues/1693
-        let query = format!(
-            "{sql_command} FROM type::table($table) WHERE {field} {operand} $value"
-        );
+        let query =
+            format!("{sql_command} FROM type::table($table) WHERE {field} {operand} $value");
 
         let mut response = client.query(query).await?;
         let result: Vec<Self> = response.take(0)?;
@@ -184,12 +187,13 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
             CREATED_AT_FIELD.to_owned(),
             serde_json::to_value(Utc::now())?,
         );
+
         serde_value.insert(
             UPDATED_AT_FIELD.to_owned(),
             serde_json::to_value(Utc::now())?,
         );
 
-        let id = self.uuid().uuid_string();
+        let id = self.uuid().to_uuid_string();
 
         let opt: Option<Self> = client
             .create((Self::table().to_string(), id.to_owned()))
@@ -226,28 +230,32 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
             };
 
             serde_value.insert(
-                UPDATED_AT_FIELD.to_owned(),
+                DELETED_AT_FIELD.to_owned(),
                 serde_json::to_value(Utc::now())?,
             );
 
             let created: Option<Self> = client
                 .create((
                     format!("z_trashed_{}", Self::table()),
-                    self.uuid().uuid_string(),
+                    self.uuid().to_uuid_string(),
                 ))
-                .content(serde_json::to_value(self)?)
+                .content(serde_value)
                 .await?;
 
             created.ok_or_else(|| {
                 SurrealSocketError::new(&format!(
                     "Failed to create trash table record: {}",
-                    self.uuid().uuid_string()
+                    self.uuid().to_uuid_string()
                 ))
             })?;
         }
 
         let thing = self.thing();
-        let _: Option<Self> = client.delete((thing.tb, self.uuid().uuid_string())).await?;
+
+        let _: Option<Self> = client
+            .delete((thing.tb, self.uuid().to_uuid_string()))
+            .await?;
+
         self.post_delete_hook().await?;
         Ok(())
     }
@@ -283,23 +291,23 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
             serde_json::to_value(Utc::now())?,
         );
 
-        for update in updates {
-            merge_data.insert(update.0.to_owned(), serde_json::to_value(update.1.clone())?);
+        for (k, v) in updates {
+            merge_data.insert(k.to_owned(), serde_json::to_value(v)?);
         }
 
         let _: Option<Self> = client
-            .update((Self::table().to_string(), self.uuid().uuid_string()))
+            .update((Self::table().to_string(), self.uuid().to_uuid_string()))
             .merge(merge_data)
             .await?;
 
-        self.post_delete_hook().await?;
+        self.post_update_hook().await?;
         Ok(())
     }
 
     async fn db_overwrite(&self, client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
         self.pre_update_hook().await?;
         let serde_value = serde_json::to_value(self)?;
-        let id = self.uuid().uuid_string();
+        let id = self.uuid().to_uuid_string();
 
         let mut serde_value = match serde_value.as_object() {
             Some(obj) => obj.clone(),
@@ -313,7 +321,7 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
 
         let _: Option<Self> = client
             .update((Self::table().to_string(), id))
-            .content(serde_value)
+            .merge(serde_value)
             .await?;
 
         self.post_update_hook().await?;
@@ -330,29 +338,23 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
     /// For each record in the table, add any missing properties with default values to the record in the database.
     ///
     /// Record retrieval already uses default values for missing fields, but this exists just in case it's ever needed.
-    #[allow(unused)]
     async fn db_populate_defaults(client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
         let result = Self::db_all(client).await?;
         let table = Self::table();
 
         for item in result {
             let _: Option<Self> = client
-                .update((table.to_string(), item.uuid().uuid_string()))
-                .content(item)
+                .update((table.to_string(), item.uuid().to_uuid_string()))
+                .merge(item)
                 .await?;
         }
 
         Ok(())
     }
 
-    async fn db_delete_table(client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
+    async fn db_drop_table(client: &Surreal<Client>) -> Result<(), SurrealSocketError> {
         let table_string = Self::table().to_string();
-        client.set("table", table_string.to_owned()).await?;
-
-        client
-            .query(format!("REMOVE TABLE {table_string}"))
-            .await?;
-
+        client.query(format!("REMOVE TABLE {table_string}")).await?;
         Ok(())
     }
 }
@@ -403,12 +405,14 @@ where
     T: DBRecord,
 {
     /// Get the Thing (`surrealdb::sql::thing::Thing`) from the SsUuid.
-    pub fn thing(&self) -> Thing {
-        self.0.to_owned()
+    pub fn as_thing(&self) -> &Thing {
+        &self.0
     }
 
-    /// Get the SsUuid as a string. (Format: 87e4f33a-e9e1-411c-8f74-9f6f1098096e)
-    pub fn uuid_string(&self) -> String {
+    /// Get the SsUuid's uuid component as a string (eg: "87e4f33a-e9e1-411c-8f74-9f6f1098096e")
+    ///
+    /// Use to_string() to include the table name (eg: "users:87e4f33a-e9e1-411c-8f74-9f6f1098096e")
+    pub fn to_uuid_string(&self) -> String {
         match &self.0.id {
             Id::Uuid(uuid) => uuid.0.to_string(),
             Id::String(s) => s.to_owned(),
@@ -425,33 +429,37 @@ where
     ///
     /// Returns an `Error` if SurrealDB unexpectedly fails.
     ///
-    /// If a missing object should not result in an error, use `object_opt()` instead.
-    #[allow(dead_code)]
-    pub async fn object(&self, client: &Surreal<Client>) -> Result<T, SurrealSocketError>
+    /// If a missing object should not result in an error, use `db_fetch_opt()` instead.
+    pub async fn db_fetch(&self, client: &Surreal<Client>) -> Result<T, SurrealSocketError>
     where
         T: DBRecord,
     {
-        let opt = self.object_opt(client).await?;
-        let obj = opt.ok_or_else(|| SurrealSocketError::new("Associated object not found"))?;
+        let opt = self.db_fetch_opt(client).await?;
+        let obj = opt.ok_or_else(|| {
+            SurrealSocketError::new(&format!(
+                "Associated object of type `{}` not found",
+                std::any::type_name::<T>()
+            ))
+        })?;
         Ok(obj)
     }
 
     /// Get the object associated with the SsUuid, or `None` if not found.
-    pub async fn object_opt(
+    pub async fn db_fetch_opt(
         &self,
         client: &Surreal<Client>,
     ) -> Result<Option<T>, SurrealSocketError>
     where
         T: DBRecord,
     {
-        let obj: Option<T> = T::db_by_id(client, &self.uuid_string()).await?;
+        let obj: Option<T> = T::db_get_by_id(client, &self.to_uuid_string()).await?;
         Ok(obj)
     }
 }
 
 impl<T: DBRecord> Display for SsUuid<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.0.tb, self.uuid_string())
+        write!(f, "{}:{}", self.0.tb, self.to_uuid_string())
     }
 }
 
@@ -466,7 +474,7 @@ impl<T: DBRecord> Serialize for SsUuid<T> {
     where
         S: Serializer,
     {
-        let s = format!("{}:{}", self.0.tb, self.uuid_string());
+        let s = format!("{}:{}", self.0.tb, self.to_uuid_string());
         serializer.serialize_str(&s)
     }
 }
@@ -478,7 +486,7 @@ impl<'de, T: DBRecord> Deserialize<'de> for SsUuid<T> {
     {
         struct UUIDVisitor<T>(PhantomData<T>);
 
-        impl<T> serde::de::Visitor<'_> for UUIDVisitor<T> {
+        impl<'de, T> serde::de::Visitor<'de> for UUIDVisitor<T> {
             type Value = SsUuid<T>;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
