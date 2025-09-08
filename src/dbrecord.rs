@@ -436,10 +436,7 @@ where
     {
         let opt = self.db_fetch_opt(client).await?;
         let obj = opt.ok_or_else(|| {
-            SurrealSocketError::new(&format!(
-                "Associated object of type `{}` not found",
-                std::any::type_name::<T>()
-            ))
+            SurrealSocketError::new(&format!("{} not found", short_type_name::<T>()))
         })?;
         Ok(obj)
     }
@@ -455,6 +452,13 @@ where
         let obj: Option<T> = T::db_get_by_id(client, &self.to_uuid_string()).await?;
         Ok(obj)
     }
+}
+
+fn short_type_name<T>() -> &'static str {
+    std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or_default()
 }
 
 impl<T: DBRecord> Display for SsUuid<T> {
