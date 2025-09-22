@@ -357,6 +357,64 @@ pub trait DBRecord: Any + Serialize + DeserializeOwned + Send + Sync {
         client.query(format!("REMOVE TABLE {table_string}")).await?;
         Ok(())
     }
+
+    async fn db_get_timestamp(
+        &self,
+        client: &Surreal<Client>,
+        field: &str,
+    ) -> Result<DateTime<Utc>, SurrealSocketError> {
+        let uuid_field = Self::UUID_FIELD;
+
+        let mut response = client
+            .query(format!(
+                "SELECT {field} FROM type::table($table) WHERE {uuid_field} = $uuid"
+            ))
+            .bind(("uuid", self.uuid().to_string()))
+            .bind(("table", Self::table().to_string()))
+            .await?;
+
+        let response: Vec<HashMap<String, serde_json::Value>> = response.take(0)?;
+        let first = response.first();
+
+        let map = if let Some(field) = first {
+            field
+        } else {
+            return Err(SurrealSocketError::new(&format!(
+                "{} not found",
+                short_type_name::<Self>()
+            )));
+        };
+
+        let dt_str = map.get(field).and_then(|v| v.as_str()).ok_or_else(|| {
+            SurrealSocketError::new(&format!(
+                "Missing or invalid field: {field} in record {}",
+                self.uuid()
+            ))
+        })?;
+
+        let dt = DateTime::parse_from_rfc3339(dt_str).map_err(|e| {
+            SurrealSocketError::new(&format!(
+                "Failed to parse datetime field {field} in record {}: {e}",
+                self.uuid()
+            ))
+        })?;
+
+        Ok(dt.with_timezone(&Utc))
+    }
+
+    async fn db_get_updated_at(
+        &self,
+        client: &Surreal<Client>,
+    ) -> Result<DateTime<Utc>, SurrealSocketError> {
+        self.db_get_timestamp(client, UPDATED_AT_FIELD).await
+    }
+
+    async fn db_get_created_at(
+        &self,
+        client: &Surreal<Client>,
+    ) -> Result<DateTime<Utc>, SurrealSocketError> {
+        self.db_get_timestamp(client, CREATED_AT_FIELD).await
+    }
 }
 
 pub enum SQLCommand {
